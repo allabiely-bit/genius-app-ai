@@ -1,23 +1,40 @@
-import os
-import json
-import urllib.request
-import urllib.error
 
-from flask import Flask, request, render_template_string
+import os
+import re
+import io
+import json
+import time
+import uuid
+import zipfile
+import threading
+from flask import Flask, request, render_template_string, send_file
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 32 * 1024
 
-GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash"
+).strip()
 
-PAGE = r"""
+MAX_FILES = 40
+MAX_TOTAL_SIZE = 1500000
+MAX_DESCRIPTION_LENGTH = 5000
+BUNDLE_TTL = 3600
+
+bundles = {}
+bundles_lock = threading.Lock()
+
+
+HTML = """
 <!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#0a0820">
-
+<meta name="viewport"
+content="width=device-width, initial-scale=1.0">
 <title>GENIUS APP AI</title>
 
 <style>
@@ -27,7 +44,7 @@ PAGE = r"""
 
 body {
     margin: 0;
-    padding: 20px 14px;
+    padding: 18px;
     background: #0a0820;
     color: white;
     font-family: Arial, sans-serif;
@@ -35,12 +52,12 @@ body {
 
 .container {
     max-width: 760px;
-    margin: 0 auto;
+    margin: auto;
 }
 
 header {
     text-align: center;
-    padding: 24px 8px;
+    padding: 22px 10px;
 }
 
 .logo {
@@ -48,19 +65,19 @@ header {
 }
 
 h1 {
-    color: #c5a3ff;
-    font-size: 29px;
+    color: #b69aff;
+    font-size: 28px;
     margin: 12px 0;
 }
 
 .subtitle {
-    color: #c4bddb;
+    color: #c8c4df;
     line-height: 1.6;
 }
 
 .card {
     background: #191537;
-    border: 1px solid #37305e;
+    border: 1px solid #38305e;
     border-radius: 18px;
     padding: 20px;
     margin: 18px 0;
@@ -68,35 +85,39 @@ h1 {
 
 label {
     display: block;
-    margin: 18px 0 9px;
     font-weight: bold;
+    margin: 16px 0 9px;
+    color: #e5ddff;
 }
 
 textarea, select {
     width: 100%;
-    border: 1px solid #554786;
+    border: 1px solid #51457e;
+    background: #0e0b28;
+    color: white;
     border-radius: 10px;
     padding: 14px;
-    background: #0e0b29;
-    color: white;
     font-size: 16px;
 }
 
 textarea {
-    min-height: 160px;
+    min-height: 150px;
     resize: vertical;
 }
 
-button {
+button, .download {
+    display: block;
     width: 100%;
+    padding: 15px;
     border: none;
     border-radius: 12px;
-    padding: 16px 12px;
-    margin-top: 20px;
     background: #7c00ff;
     color: white;
     font-size: 16px;
     font-weight: bold;
+    text-align: center;
+    text-decoration: none;
+    margin-top: 18px;
     cursor: pointer;
 }
 
@@ -104,32 +125,61 @@ button:disabled {
     opacity: 0.6;
 }
 
-.note {
-    color: #c4bddb;
-    font-size: 13px;
-    line-height: 1.7;
+.secondary {
+    background: #252044;
+    border: 1px solid #6753a5;
 }
 
-.result {
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    line-height: 1.65;
-    font-size: 15px;
+.small {
+    font-size: 13px;
+    color: #bcb5dc;
+    line-height: 1.6;
 }
 
 .success {
-    color: #83ffd0;
+    color: #70f2bc;
+    line-height: 1.6;
 }
 
 .error {
-    color: #ffaaa9;
+    color: #ff9aab;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+}
+
+.file {
+    background: #100d2b;
+    border: 1px solid #39315e;
+    border-radius: 9px;
+    padding: 12px;
+    margin: 8px 0;
+    overflow-wrap: anywhere;
+}
+
+.file-name {
+    color: #81e5ff;
+    font-weight: bold;
+}
+
+.file-size {
+    color: #aaa2ce;
+    font-size: 12px;
+    margin-top: 5px;
+}
+
+pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: #ded7ff;
+    line-height: 1.6;
+    font-family: Arial, sans-serif;
 }
 
 footer {
     text-align: center;
-    color: #aaa1ca;
+    color: #827ba7;
     font-size: 12px;
-    padding: 20px 8px;
+    padding: 20px 0;
 }
 </style>
 </head>
@@ -140,70 +190,109 @@ footer {
 <header>
     <div class="logo">🧠</div>
     <h1>GENIUS APP AI</h1>
-    <p class="subtitle">
-        Décris ton idée. L'intelligence artificielle t'aide
-        à préparer ton projet.
-    </p>
+    <div class="subtitle">
+        Décris ton idée. Génère ton projet.<br>
+        Construis tes applications avec l'IA.
+    </div>
 </header>
 
-<section class="card">
-    <form method="POST" action="/" onsubmit="document.getElementById('submit').disabled=true; document.getElementById('submit').textContent='⏳ L’IA RÉFLÉCHIT...';">
+<div class="card">
+    <h2>🚀 Créons ton projet</h2>
+
+    <form method="POST" action="/"
+          onsubmit="document.getElementById('submit').disabled=true;
+          document.getElementById('submit').innerText='⏳ GÉNÉRATION EN COURS...';">
 
         <label for="description">
-            ✍️ Décris l'application que tu veux créer
+            1. Décris l'application que tu veux créer
         </label>
 
-        <textarea
-            id="description"
-            name="description"
-            maxlength="12000"
-            required
-            placeholder="Exemple : Je veux créer un jeu de football en 3D avec deux équipes de 11 joueurs, un ballon, des buts et un bouton pour tirer."
-        >{{ description }}</textarea>
+        <textarea id="description" name="description"
+        maxlength="5000" required
+        placeholder="Exemple : crée une application Android de gestion des dépenses avec un tableau de bord, l'ajout de revenus et de dépenses, des statistiques et une sauvegarde des données. Je veux une interface moderne en français.">{{ description|default('') }}</textarea>
 
         <label for="platform">
-            📱 Choisis la plateforme
+            2. Choisis la plateforme
         </label>
 
         <select id="platform" name="platform">
-            <option value="Android" {% if platform == "Android" %}selected{% endif %}>
-                Application Android (APK)
+            <option value="android"
+            {% if platform == 'android' %}selected{% endif %}>
+                📱 Application Android (Kotlin)
             </option>
 
-            <option value="Web" {% if platform == "Web" %}selected{% endif %}>
-                Application Web
+            <option value="web"
+            {% if platform == 'web' %}selected{% endif %}>
+                🌐 Application Web
             </option>
         </select>
 
         <button id="submit" type="submit">
-            🚀 DEMANDER À L'IA
+            ✨ GÉNÉRER MON PROJET
         </button>
-
     </form>
 
-    <p class="note">
-        Première version expérimentale : l'IA propose une architecture
-        et du code. La compilation automatique des APK sera ajoutée
-        dans une prochaine étape.
+    <p class="small">
+        GENIUS APP AI transforme ta description en fichiers
+        organisés. La compilation automatique en APK sera
+        ajoutée dans une prochaine évolution.
     </p>
-</section>
-
-{% if result %}
-<section class="card">
-    <h2 class="success">✅ Réponse de GENIUS APP AI</h2>
-    <div class="result">{{ result }}</div>
-</section>
-{% endif %}
+</div>
 
 {% if error %}
-<section class="card">
-    <h2 class="error">⚠️ Un problème est survenu</h2>
-    <div class="result">{{ error }}</div>
-</section>
+<div class="card">
+    <h3 class="error">⚠️ Un problème est survenu</h3>
+    <p class="error">{{ error }}</p>
+    <p class="small">
+        Vérifie ta connexion Internet et réessaie.
+        Ne partage jamais ta clé API.
+    </p>
+</div>
+{% endif %}
+
+{% if project %}
+<div class="card">
+    <h2 class="success">✅ Projet généré !</h2>
+
+    <h3>{{ project.project_name }}</h3>
+
+    <p>{{ project.summary }}</p>
+
+    <p class="small">
+        {{ project.files|length }} fichier(s) généré(s)
+    </p>
+
+    <a class="download"
+       href="/download/{{ download_token }}">
+       📦 TÉLÉCHARGER LE PROJET ZIP
+    </a>
+
+    <h3>📂 Fichiers du projet</h3>
+
+    {% for file in project.files %}
+    <div class="file">
+        <div class="file-name">
+            📄 {{ file.path }}
+        </div>
+        <div class="file-size">
+            {{ file.size }} octets
+        </div>
+    </div>
+    {% endfor %}
+
+    <h3>📘 Instructions</h3>
+    <pre>{{ project.instructions }}</pre>
+
+    <p class="small">
+        Le ZIP contient les fichiers générés. Il faudra
+        vérifier le projet et le compiler avant de pouvoir
+        installer une application Android.
+    </p>
+</div>
 {% endif %}
 
 <footer>
-    GENIUS APP AI — Créons tes idées, étape par étape.
+    GENIUS APP AI • Imagine • Crée • Construis
 </footer>
 
 </div>
@@ -212,189 +301,500 @@ footer {
 """
 
 
-def ask_gemini(description, platform):
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+def clean_expired_bundles():
+    now = time.time()
 
-    if not api_key:
-        raise RuntimeError(
-            "La clé API Gemini n'est pas configurée sur le serveur."
+    with bundles_lock:
+        expired = [
+            token for token, item in bundles.items()
+            if now - item["created"] > BUNDLE_TTL
+        ]
+
+        for token in expired:
+            bundles.pop(token, None)
+
+        while len(bundles) > 5:
+            oldest = min(
+                bundles,
+                key=lambda token: bundles[token]["created"]
+            )
+            bundles.pop(oldest, None)
+
+
+def safe_project_path(path):
+    if not isinstance(path, str):
+        return None
+
+    path = path.strip().replace("\\\\", "/")
+
+    if not path or len(path) > 200:
+        return None
+
+    if path.startswith("/") or path.startswith("~"):
+        return None
+
+    if re.match(r"^[A-Za-z]:", path):
+        return None
+
+    parts = path.split("/")
+
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+
+    if any(
+        part.startswith(".")
+        and part.lower() in (
+            ".env",
+            ".git",
+            ".ssh",
+            ".aws"
+        )
+        for part in parts
+    ):
+        return None
+
+    filename = parts[-1].lower()
+
+    if filename in (
+        ".env",
+        ".env.local",
+        ".env.production",
+        "id_rsa",
+        "id_ed25519"
+    ):
+        return None
+
+    return "/".join(parts)
+
+
+def extract_json(text):
+    text = text.strip()
+
+    text = re.sub(
+        r"^```(?:json)?\\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(r"\\s*```$", "", text)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end <= start:
+        raise ValueError(
+            "L'IA n'a pas renvoyé un projet au format attendu."
         )
 
-    if platform == "Android":
-        instructions = """
-Tu es l'assistant technique de GENIUS APP AI.
-L'utilisateur veut créer une application Android.
+    return json.loads(text[start:end + 1])
 
-Réponds en français simple et organise ta réponse ainsi :
-1. Résumé de l'application.
-2. Fonctionnalités principales.
-3. Technologies et architecture recommandées.
-4. Organisation des fichiers du projet.
-5. Premier exemple de code utile et cohérent.
-6. Étapes suivantes pour construire et tester le projet.
 
-Fournis du code lisible et indique le nom du fichier auquel il correspond.
-Ne prétends jamais qu'un APK a été compilé ou testé si ce n'est pas vrai.
-Si la demande est trop grande, propose une première version réalisable.
+def generate_project(description, platform):
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "La clé GEMINI_API_KEY est absente des variables "
+            "d'environnement de Render."
+        )
+
+    if platform == "android":
+        platform_rules = """
+PLATEFORME ANDROID :
+- Utilise Kotlin et Android Gradle.
+- Génère un vrai squelette de projet Android.
+- Inclus settings.gradle.kts.
+- Inclus build.gradle.kts à la racine.
+- Inclus app/build.gradle.kts.
+- Inclus app/src/main/AndroidManifest.xml.
+- Inclus le code Kotlin nécessaire.
+- Inclus les ressources nécessaires dans res si utile.
+- Inclus un README.md avec les étapes de compilation.
+- Utilise des versions de dépendances compatibles entre elles.
+- N'affirme pas qu'une compilation a réussi : aucun build
+  n'a encore été exécuté.
+- Le projet doit être autonome autant que possible.
 """
     else:
-        instructions = """
-Tu es l'assistant technique de GENIUS APP AI.
-L'utilisateur veut créer une application Web.
-
-Réponds en français simple et organise ta réponse ainsi :
-1. Résumé de l'application.
-2. Fonctionnalités principales.
-3. Technologies et architecture recommandées.
-4. Organisation des fichiers du projet.
-5. Premier exemple de code utile et cohérent.
-6. Étapes suivantes pour construire et tester le projet.
-
-Fournis du code lisible et indique le nom du fichier auquel il correspond.
-Ne prétends jamais qu'un projet a été testé si ce n'est pas vrai.
-Si la demande est trop grande, propose une première version réalisable.
+        platform_rules = """
+PLATEFORME WEB :
+- Génère une application Web complète et organisée.
+- Inclus les fichiers HTML, CSS et JavaScript nécessaires.
+- Inclus README.md avec les instructions de lancement.
+- Si un serveur est nécessaire, inclus ses fichiers de
+  configuration et les dépendances nécessaires.
+- Préfère une solution simple à lancer.
 """
 
-    payload = {
-        "systemInstruction": {
-            "parts": [
-                {"text": instructions}
-            ]
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": description}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 4096
-        }
-    }
+    prompt = f"""
+Tu es GENIUS APP AI, un ingénieur logiciel expérimenté.
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
+MISSION :
+Créer un projet logiciel complet à partir de cette demande :
+
+{description}
+
+PLATEFORME :
+{platform}
+
+{platform_rules}
+
+RÈGLES IMPORTANTES :
+1. Génère le plus possible un projet fonctionnel, pas seulement
+   une architecture ou quelques extraits de code.
+2. Tous les fichiers doivent avoir leur contenu complet.
+3. Les chemins doivent être relatifs à la racine du projet.
+4. Ne mets aucun secret, mot de passe, jeton ou clé API dans
+   les fichiers générés.
+5. N'utilise jamais de chemin absolu ni de chemin contenant
+   "..".
+6. Limite le projet à {MAX_FILES} fichiers maximum.
+7. Si le projet est trop grand, privilégie les fichiers
+   essentiels nécessaires à son fonctionnement.
+8. Les instructions doivent être en français.
+9. Ne prétends pas avoir exécuté des tests ou compilé le projet.
+10. Le code doit être cohérent entre les différents fichiers.
+
+RENVOIE UNIQUEMENT UN OBJET JSON VALIDE, sans Markdown,
+sans ``` et sans texte avant ou après.
+
+Respecte exactement cette structure :
+
+{{
+  "project_name": "nom-du-projet",
+  "summary": "Résumé du projet",
+  "instructions": "Instructions de lancement et de compilation",
+  "files": [
+    {{
+      "path": "README.md",
+      "content": "Contenu complet du fichier"
+    }}
+  ]
+}}
+"""
+
+    endpoint = (
+        "https://generativelanguage.googleapis.com/"
+        "v1beta/models/"
         + GEMINI_MODEL
         + ":generateContent"
     )
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.2
+        }
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+
+    req = Request(
+        endpoint,
+        data=data,
         headers={
             "Content-Type": "application/json",
-            "x-goog-api-key": api_key
+            "x-goog-api-key": GEMINI_API_KEY
         },
         method="POST"
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=90) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        with urlopen(req, timeout=150) as response:
+            raw = response.read().decode("utf-8")
 
-    except urllib.error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-
-        if exc.code == 400:
-            raise RuntimeError(
-                "La requête a été refusée. Vérifie la description "
-                "et le modèle Gemini configuré."
-            )
-
-        if exc.code == 401 or exc.code == 403:
-            raise RuntimeError(
-                "Google a refusé l'accès à l'API. Vérifie la clé "
-                "API et les autorisations du projet."
-            )
+    except HTTPError as exc:
+        details = exc.read().decode(
+            "utf-8", errors="replace"
+        )
 
         if exc.code == 429:
             raise RuntimeError(
-                "La limite de requêtes Gemini est atteinte, "
-                "ou le quota disponible est épuisé. Réessaie plus tard."
+                "La limite de requêtes de l'API Gemini est "
+                "atteinte. Attends un peu puis réessaie."
             )
 
-        print("Erreur API Gemini :", exc.code, details[:1500])
+        if exc.code in (401, 403):
+            raise RuntimeError(
+                "Gemini refuse la clé API ou son accès. "
+                "Vérifie la configuration de Render."
+            )
+
+        if exc.code == 404:
+            raise RuntimeError(
+                "Le modèle Gemini configuré n'est pas "
+                "disponible. Vérifie le nom du modèle."
+            )
+
+        print("Erreur Gemini HTTP", exc.code, details[:1000])
 
         raise RuntimeError(
-            "Le service Gemini a rencontré une erreur HTTP "
+            "Le service Gemini a renvoyé une erreur HTTP "
             + str(exc.code)
-            + ". Consulte les journaux du serveur pour plus de détails."
+            + ". Réessaie plus tard."
         )
 
-    except urllib.error.URLError:
+    except (URLError, TimeoutError):
         raise RuntimeError(
-            "Impossible de joindre Google Gemini. Vérifie la connexion "
-            "du serveur et réessaie."
+            "Le service Gemini ne répond pas actuellement. "
+            "Vérifie la connexion et réessaie."
         )
 
-    candidates = data.get("candidates", [])
+    try:
+        response_data = json.loads(raw)
 
-    if not candidates:
+        candidates = response_data.get("candidates", [])
+
+        if not candidates:
+            raise ValueError("Aucune réponse de Gemini.")
+
+        parts = candidates[0].get(
+            "content", {}
+        ).get("parts", [])
+
+        answer = "".join(
+            part.get("text", "")
+            for part in parts
+            if isinstance(part.get("text"), str)
+        )
+
+        if not answer.strip():
+            raise ValueError("La réponse de Gemini est vide.")
+
+        project = extract_json(answer)
+
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         raise RuntimeError(
-            "Gemini n'a pas renvoyé de réponse exploitable. Réessaie."
+            "La réponse de l'IA n'a pas pu être convertie "
+            "en projet. Essaie une description plus simple."
         )
 
-    parts = candidates[0].get("content", {}).get("parts", [])
-
-    answer = "\n".join(
-        part["text"]
-        for part in parts
-        if isinstance(part, dict) and "text" in part
-    ).strip()
-
-    if not answer:
+    if not isinstance(project, dict):
         raise RuntimeError(
-            "La réponse de Gemini est vide. Réessaie avec une autre demande."
+            "Le format du projet généré est incorrect."
         )
 
-    return answer
+    raw_files = project.get("files")
+
+    if not isinstance(raw_files, list) or not raw_files:
+        raise RuntimeError(
+            "Aucun fichier n'a été fourni par l'IA."
+        )
+
+    if len(raw_files) > MAX_FILES:
+        raw_files = raw_files[:MAX_FILES]
+
+    files = []
+    seen_paths = set()
+    total_size = 0
+
+    for item in raw_files:
+        if not isinstance(item, dict):
+            continue
+
+        path = safe_project_path(item.get("path"))
+        content = item.get("content")
+
+        if path is None or not isinstance(content, str):
+            continue
+
+        if path in seen_paths:
+            continue
+
+        content_bytes = content.encode("utf-8")
+
+        if len(content_bytes) > MAX_TOTAL_SIZE:
+            continue
+
+        if total_size + len(content_bytes) > MAX_TOTAL_SIZE:
+            break
+
+        seen_paths.add(path)
+        total_size += len(content_bytes)
+
+        files.append({
+            "path": path,
+            "content": content,
+            "size": len(content_bytes)
+        })
+
+    if not files:
+        raise RuntimeError(
+            "Les fichiers générés sont vides ou invalides. "
+            "Réessaie avec une demande plus précise."
+        )
+
+    project_name = str(
+        project.get("project_name", "mon-projet")
+    )[:100]
+
+    project["project_name"] = project_name
+    project["summary"] = str(
+        project.get("summary", "Projet généré par l'IA.")
+    )[:3000]
+
+    project["instructions"] = str(
+        project.get(
+            "instructions",
+            "Consulte le fichier README.md."
+        )
+    )[:10000]
+
+    project["files"] = files
+
+    return project
+
+
+def create_zip(project):
+    memory_file = io.BytesIO()
+
+    with zipfile.ZipFile(
+        memory_file,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED
+    ) as archive:
+
+        for item in project["files"]:
+            archive.writestr(
+                item["path"],
+                item["content"]
+            )
+
+    memory_file.seek(0)
+
+    return memory_file.read()
 
 
 @app.route("/", methods=["GET", "POST"])
-def home():
+def index():
     description = ""
-    platform = "Android"
-    result = ""
-    error = ""
+    platform = "android"
+    project = None
+    error = None
+    download_token = None
 
     if request.method == "POST":
-        description = request.form.get("description", "").strip()
-        platform = request.form.get("platform", "Android").strip()
+        description = request.form.get(
+            "description", ""
+        ).strip()
 
-        if platform not in ("Android", "Web"):
-            platform = "Android"
+        platform = request.form.get(
+            "platform", "android"
+        ).strip()
+
+        if platform not in ("android", "web"):
+            platform = "android"
 
         if not description:
-            error = "Décris ton application avant de continuer."
+            error = "Décris d'abord l'application à créer."
 
-        elif len(description) > 12000:
-            error = "La description est trop longue."
+        elif len(description) > MAX_DESCRIPTION_LENGTH:
+            error = (
+                "Ta description est trop longue. "
+                "Réduis-la à 5000 caractères maximum."
+            )
 
         else:
             try:
-                result = ask_gemini(description, platform)
+                project = generate_project(
+                    description,
+                    platform
+                )
+
+                zip_data = create_zip(project)
+                download_token = uuid.uuid4().hex
+
+                with bundles_lock:
+                    bundles[download_token] = {
+                        "created": time.time(),
+                        "data": zip_data,
+                        "name": re.sub(
+                            r"[^a-zA-Z0-9_-]+",
+                            "-",
+                            project["project_name"]
+                        ).strip("-")[:60] or "mon-projet"
+                    }
+
+                clean_expired_bundles()
 
             except RuntimeError as exc:
                 error = str(exc)
 
             except Exception:
-                app.logger.exception("Erreur inattendue")
+                app.logger.exception(
+                    "Erreur pendant la génération du projet"
+                )
+
                 error = (
                     "Une erreur inattendue est survenue. "
-                    "Réessaie dans quelques instants."
+                    "Réessaie avec une demande plus simple."
                 )
 
     return render_template_string(
-        PAGE,
+        HTML,
         description=description,
         platform=platform,
-        result=result,
+        project=project,
+        download_token=download_token,
         error=error
     )
 
 
+@app.route("/download/<token>", methods=["GET"])
+def download_project(token):
+    with bundles_lock:
+        item = bundles.get(token)
+
+        if item is None:
+            return (
+                "Ce téléchargement a expiré. "
+                "Génère à nouveau ton projet.",
+                404
+            )
+
+        if time.time() - item["created"] > BUNDLE_TTL:
+            bundles.pop(token, None)
+
+            return (
+                "Ce téléchargement a expiré. "
+                "Génère à nouveau ton projet.",
+                404
+            )
+
+        zip_data = item["data"]
+        filename = item["name"] + ".zip"
+
+    return send_file(
+        io.BytesIO(zip_data),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=filename,
+        max_age=0
+    )
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return {
+        "status": "ok",
+        "application": "GENIUS APP AI"
+    }
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=False
+)
