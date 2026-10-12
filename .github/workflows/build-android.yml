@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       project_zip_url:
-        description: "URL de téléchargement du projet Android ZIP"
+        description: "HTTPS URL du projet Android ZIP"
         required: true
         type: string
 
@@ -24,66 +24,117 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Prepare Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          set -e
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
       - name: Prepare Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
 
-      - name: Download Android project
+      - name: Validate and download project
         env:
           PROJECT_ZIP_URL: ${{ inputs.project_zip_url }}
         run: |
-          set -e
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          from urllib.parse import urlparse
+
+          url = os.environ["PROJECT_ZIP_URL"]
+          parsed = urlparse(url)
+
+          if parsed.scheme != "https" or not parsed.hostname:
+              raise SystemExit(
+                  "Erreur : une URL HTTPS valide est obligatoire."
+              )
+
+          if parsed.username or parsed.password:
+              raise SystemExit(
+                  "Erreur : les identifiants dans l'URL sont interdits."
+              )
+          PY
+
+          mkdir -p project
           curl --fail --location --silent --show-error \
+            --max-time 120 \
             "$PROJECT_ZIP_URL" \
             --output project.zip
-          unzip -q project.zip -d project
+
+          python3 - <<'PY'
+          import zipfile
+
+          with zipfile.ZipFile("project.zip") as archive:
+              for item in archive.infolist():
+                  name = item.filename.replace("\\", "/")
+                  if name.startswith("/") or ".." in name.split("/"):
+                      raise SystemExit(
+                          "Erreur : chemin dangereux dans le ZIP."
+                      )
+              archive.extractall("project")
+          PY
+
           rm project.zip
 
       - name: Find Android project
         id: locate
         run: |
-          set -e
+          set -euo pipefail
+
           SETTINGS=$(find project -type f \
-            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            \( -name settings.gradle \
+            -o -name settings.gradle.kts \) \
             -print -quit)
 
           if [ -z "$SETTINGS" ]; then
-            echo "Erreur : settings.gradle ou settings.gradle.kts introuvable."
+            echo "Erreur : fichier settings.gradle introuvable."
             exit 1
           fi
 
           ROOT=$(dirname "$SETTINGS")
-
-          if [ ! -f "$ROOT/gradlew" ]; then
-            echo "gradlew_not_found=true" >> "$GITHUB_OUTPUT"
-          else
-            chmod +x "$ROOT/gradlew"
-            echo "gradlew_not_found=false" >> "$GITHUB_OUTPUT"
-          fi
-
           echo "project_root=$ROOT" >> "$GITHUB_OUTPUT"
+
+          if [ -f "$ROOT/gradlew" ]; then
+            chmod +x "$ROOT/gradlew"
+            echo "use_wrapper=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_wrapper=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Compile Android APK
         working-directory: ${{ steps.locate.outputs.project_root }}
+        env:
+          USE_WRAPPER: ${{ steps.locate.outputs.use_wrapper }}
         run: |
-          set -e
+          set -euo pipefail
 
-          if [ "${{ steps.locate.outputs.gradlew_not_found }}" = "true" ]; then
-            gradle assembleDebug
+          if [ "$USE_WRAPPER" = "true" ]; then
+            ./gradlew --no-daemon assembleDebug
           else
-            ./gradlew assembleDebug
+            gradle --no-daemon assembleDebug
           fi
 
       - name: Find generated APK
         id: apk
         working-directory: ${{ steps.locate.outputs.project_root }}
         run: |
-          set -e
-          APK=$(find . -type f -path "*/build/outputs/apk/*/*.apk" -print -quit)
+          set -euo pipefail
+
+          APK=$(find . -type f \
+            -path "*/build/outputs/apk/*/*.apk" \
+            -print -quit)
 
           if [ -z "$APK" ]; then
-            echo "Erreur : aucun fichier APK généré."
+            echo "Erreur : aucun APK n'a été généré."
             exit 1
           fi
 
