@@ -1,4 +1,3 @@
-
 import os
 import re
 import io
@@ -7,20 +6,30 @@ import time
 import uuid
 import zipfile
 import threading
-from flask import Flask, request, render_template_string, send_file
+
+from flask import (
+    Flask,
+    request,
+    render_template_string,
+    send_file
+)
+
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
+
 app = Flask(__name__)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_API_KEY = os.environ.get(
+    "GEMINI_API_KEY", ""
+).strip()
+
 GEMINI_MODEL = os.environ.get(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash"
+    "GEMINI_MODEL", "gemini-3.8-flash"
 ).strip()
 
 MAX_FILES = 40
-MAX_TOTAL_SIZE = 1500000
+MAX_TOTAL_SIZE = 1_500_000
 MAX_DESCRIPTION_LENGTH = 5000
 BUNDLE_TTL = 3600
 
@@ -35,6 +44,7 @@ HTML = """
 <meta charset="UTF-8">
 <meta name="viewport"
 content="width=device-width, initial-scale=1.0">
+
 <title>GENIUS APP AI</title>
 
 <style>
@@ -67,7 +77,6 @@ header {
 h1 {
     color: #b69aff;
     font-size: 28px;
-    margin: 12px 0;
 }
 
 .subtitle {
@@ -125,11 +134,6 @@ button:disabled {
     opacity: 0.6;
 }
 
-.secondary {
-    background: #252044;
-    border: 1px solid #6753a5;
-}
-
 .small {
     font-size: 13px;
     color: #bcb5dc;
@@ -138,6 +142,11 @@ button:disabled {
 
 .success {
     color: #70f2bc;
+    line-height: 1.6;
+}
+
+.warning {
+    color: #ffd580;
     line-height: 1.6;
 }
 
@@ -209,7 +218,7 @@ footer {
 
         <textarea id="description" name="description"
         maxlength="5000" required
-        placeholder="Exemple : crée une application Android de gestion des dépenses avec un tableau de bord, l'ajout de revenus et de dépenses, des statistiques et une sauvegarde des données. Je veux une interface moderne en français.">{{ description|default('') }}</textarea>
+        placeholder="Exemple : crée une application Android de gestion des dépenses...">{{ description|default('') }}</textarea>
 
         <label for="platform">
             2. Choisis la plateforme
@@ -233,9 +242,9 @@ footer {
     </form>
 
     <p class="small">
-        GENIUS APP AI transforme ta description en fichiers
-        organisés. La compilation automatique en APK sera
-        ajoutée dans une prochaine évolution.
+        Les fichiers sont contrôlés automatiquement.
+        Ces contrôles ne remplacent pas une véritable
+        compilation ou des tests d'exécution.
     </p>
 </div>
 
@@ -244,15 +253,15 @@ footer {
     <h3 class="error">⚠️ Un problème est survenu</h3>
     <p class="error">{{ error }}</p>
     <p class="small">
-        Vérifie ta connexion Internet et réessaie.
-        Ne partage jamais ta clé API.
+        Vérifie ta connexion et réessaie lorsque le
+        service sera disponible. Ne partage jamais ta clé API.
     </p>
 </div>
 {% endif %}
 
 {% if project %}
 <div class="card">
-    <h2 class="success">✅ Projet généré !</h2>
+    <h2 class="success">✅ Projet généré</h2>
 
     <h3>{{ project.project_name }}</h3>
 
@@ -261,6 +270,23 @@ footer {
     <p class="small">
         {{ project.files|length }} fichier(s) généré(s)
     </p>
+
+    <h3>🔎 Contrôle automatique</h3>
+
+    {% if project.checks.ok %}
+        <p class="success">
+            ✅ Les contrôles de structure sont satisfaisants.
+        </p>
+    {% else %}
+        <p class="warning">
+            ⚠️ Certains éléments attendus sont manquants.
+            Le projet peut nécessiter des corrections.
+        </p>
+    {% endif %}
+
+    {% for message in project.checks.messages %}
+        <div class="file">{{ message }}</div>
+    {% endfor %}
 
     <a class="download"
        href="/download/{{ download_token }}">
@@ -284,9 +310,9 @@ footer {
     <pre>{{ project.instructions }}</pre>
 
     <p class="small">
-        Le ZIP contient les fichiers générés. Il faudra
-        vérifier le projet et le compiler avant de pouvoir
-        installer une application Android.
+        Le rapport vérifie des éléments de structure.
+        Il ne garantit pas que le code fonctionne.
+        La compilation automatique sera ajoutée séparément.
     </p>
 </div>
 {% endif %}
@@ -306,7 +332,8 @@ def clean_expired_bundles():
 
     with bundles_lock:
         expired = [
-            token for token, item in bundles.items()
+            token
+            for token, item in bundles.items()
             if now - item["created"] > BUNDLE_TTL
         ]
 
@@ -341,27 +368,24 @@ def safe_project_path(path):
     if any(part in ("", ".", "..") for part in parts):
         return None
 
-    if any(
-        part.startswith(".")
-        and part.lower() in (
-            ".env",
-            ".git",
-            ".ssh",
-            ".aws"
-        )
-        for part in parts
-    ):
-        return None
-
-    filename = parts[-1].lower()
-
-    if filename in (
+    forbidden = {
         ".env",
         ".env.local",
         ".env.production",
         "id_rsa",
         "id_ed25519"
-    ):
+    }
+
+    if any(part.lower() in forbidden for part in parts):
+        return None
+
+    if ".git" in [part.lower() for part in parts]:
+        return None
+
+    if ".ssh" in [part.lower() for part in parts]:
+        return None
+
+    if ".aws" in [part.lower() for part in parts]:
         return None
 
     return "/".join(parts)
@@ -395,11 +419,142 @@ def extract_json(text):
     return json.loads(text[start:end + 1])
 
 
+def validate_project_structure(files, platform):
+    """
+    Vérifie localement la structure du projet.
+    Cette fonction ne contacte pas Gemini.
+    """
+
+    paths = {
+        item["path"].lower()
+        for item in files
+    }
+
+    messages = []
+    ok = True
+
+    if platform == "android":
+        expected_groups = [
+            (
+                "Fichier de configuration Gradle",
+                {
+                    "settings.gradle",
+                    "settings.gradle.kts"
+                }
+            ),
+            (
+                "Configuration Gradle principale",
+                {
+                    "build.gradle",
+                    "build.gradle.kts"
+                }
+            ),
+            (
+                "Configuration Gradle de l'application",
+                {
+                    "app/build.gradle",
+                    "app/build.gradle.kts"
+                }
+            ),
+            (
+                "Manifeste Android",
+                {
+                    "app/src/main/androidmanifest.xml"
+                }
+            )
+        ]
+
+        for label, alternatives in expected_groups:
+            if not paths.intersection(alternatives):
+                messages.append(
+                    "⚠️ " + label + " manquant."
+                )
+                ok = False
+            else:
+                messages.append(
+                    "✅ " + label + " présent."
+                )
+
+        has_source = any(
+            path.endswith(".kt") or path.endswith(".java")
+            for path in paths
+        )
+
+        if has_source:
+            messages.append("✅ Fichier source Kotlin/Java présent.")
+        else:
+            messages.append(
+                "⚠️ Aucun fichier source Kotlin ou Java détecté."
+            )
+            ok = False
+
+        has_readme = any(
+            path == "readme.md"
+            for path in paths
+        )
+
+        if has_readme:
+            messages.append("✅ README présent.")
+        else:
+            messages.append(
+                "⚠️ README absent : les instructions peuvent manquer."
+            )
+
+    else:
+        has_html = any(
+            path.endswith(".html")
+            for path in paths
+        )
+
+        has_css = any(
+            path.endswith(".css")
+            for path in paths
+        )
+
+        has_js = any(
+            path.endswith(".js")
+            for path in paths
+        )
+
+        if has_html:
+            messages.append("✅ Fichier HTML présent.")
+        else:
+            messages.append("⚠️ Aucun fichier HTML détecté.")
+            ok = False
+
+        if has_css:
+            messages.append("✅ Fichier CSS présent.")
+        else:
+            messages.append(
+                "⚠️ Aucun fichier CSS détecté. "
+                "Le projet peut utiliser un autre style."
+            )
+
+        if has_js:
+            messages.append("✅ Fichier JavaScript présent.")
+        else:
+            messages.append(
+                "⚠️ Aucun fichier JavaScript détecté. "
+                "Le projet peut être purement HTML/CSS."
+            )
+
+    if len(files) > 0:
+        messages.append(
+            "ℹ️ Nombre de fichiers vérifiés : "
+            + str(len(files))
+        )
+
+    return {
+        "ok": ok,
+        "messages": messages
+    }
+
+
 def generate_project(description, platform):
     if not GEMINI_API_KEY:
         raise RuntimeError(
-            "La clé GEMINI_API_KEY est absente des variables "
-            "d'environnement de Render."
+            "La variable GEMINI_API_KEY est absente "
+            "des variables d'environnement de Render."
         )
 
     if platform == "android":
@@ -412,57 +567,44 @@ PLATEFORME ANDROID :
 - Inclus app/build.gradle.kts.
 - Inclus app/src/main/AndroidManifest.xml.
 - Inclus le code Kotlin nécessaire.
-- Inclus les ressources nécessaires dans res si utile.
-- Inclus un README.md avec les étapes de compilation.
-- Utilise des versions de dépendances compatibles entre elles.
-- N'affirme pas qu'une compilation a réussi : aucun build
-  n'a encore été exécuté.
-- Le projet doit être autonome autant que possible.
+- Inclus les ressources nécessaires si elles sont utiles.
+- Inclus README.md avec les étapes de compilation.
+- Utilise des versions de dépendances compatibles.
+- N'affirme pas que le projet a été compilé ou testé.
 """
     else:
         platform_rules = """
 PLATEFORME WEB :
-- Génère une application Web complète et organisée.
+- Génère une application Web organisée.
 - Inclus les fichiers HTML, CSS et JavaScript nécessaires.
 - Inclus README.md avec les instructions de lancement.
-- Si un serveur est nécessaire, inclus ses fichiers de
-  configuration et les dépendances nécessaires.
+- Ajoute les fichiers de configuration nécessaires.
 - Préfère une solution simple à lancer.
 """
 
     prompt = f"""
 Tu es GENIUS APP AI, un ingénieur logiciel expérimenté.
 
-MISSION :
-Créer un projet logiciel complet à partir de cette demande :
+Crée un projet logiciel à partir de cette demande :
 
 {description}
 
-PLATEFORME :
-{platform}
+PLATEFORME : {platform}
 
 {platform_rules}
 
-RÈGLES IMPORTANTES :
-1. Génère le plus possible un projet fonctionnel, pas seulement
-   une architecture ou quelques extraits de code.
-2. Tous les fichiers doivent avoir leur contenu complet.
-3. Les chemins doivent être relatifs à la racine du projet.
-4. Ne mets aucun secret, mot de passe, jeton ou clé API dans
-   les fichiers générés.
-5. N'utilise jamais de chemin absolu ni de chemin contenant
-   "..".
-6. Limite le projet à {MAX_FILES} fichiers maximum.
-7. Si le projet est trop grand, privilégie les fichiers
-   essentiels nécessaires à son fonctionnement.
-8. Les instructions doivent être en français.
-9. Ne prétends pas avoir exécuté des tests ou compilé le projet.
-10. Le code doit être cohérent entre les différents fichiers.
+RÈGLES :
+1. Fournis le contenu complet de chaque fichier.
+2. Génère un projet cohérent, pas seulement des extraits.
+3. Utilise des chemins relatifs à la racine.
+4. N'inclus aucun secret, mot de passe ou clé API.
+5. N'utilise aucun chemin absolu ni chemin contenant "..".
+6. Limite le projet à {MAX_FILES} fichiers.
+7. Privilégie les fichiers essentiels si le projet est grand.
+8. Rédige les instructions en français.
+9. Ne prétends pas avoir exécuté de tests ou une compilation.
 
-RENVOIE UNIQUEMENT UN OBJET JSON VALIDE, sans Markdown,
-sans ``` et sans texte avant ou après.
-
-Respecte exactement cette structure :
+RENVOIE UNIQUEMENT UN OBJET JSON VALIDE, sans Markdown :
 
 {{
   "project_name": "nom-du-projet",
@@ -515,14 +657,11 @@ Respecte exactement cette structure :
             raw = response.read().decode("utf-8")
 
     except HTTPError as exc:
-        details = exc.read().decode(
-            "utf-8", errors="replace"
-        )
-
         if exc.code == 429:
             raise RuntimeError(
-                "La limite de requêtes de l'API Gemini est "
-                "atteinte. Attends un peu puis réessaie."
+                "Le quota Gemini est atteint. "
+                "Attends sa réinitialisation avant de réessayer. "
+                "Aucune nouvelle tentative automatique n'a été faite."
             )
 
         if exc.code in (401, 403):
@@ -533,22 +672,30 @@ Respecte exactement cette structure :
 
         if exc.code == 404:
             raise RuntimeError(
-                "Le modèle Gemini configuré n'est pas "
-                "disponible. Vérifie le nom du modèle."
+                "Le modèle Gemini configuré n'est pas disponible. "
+                "Vérifie le nom du modèle."
             )
 
-        print("Erreur Gemini HTTP", exc.code, details[:1000])
+        if exc.code == 503:
+            raise RuntimeError(
+                "Gemini est temporairement indisponible. "
+                "Attends quelques minutes avant de réessayer."
+            )
+
+        app.logger.warning(
+            "Erreur Gemini HTTP : %s", exc.code
+        )
 
         raise RuntimeError(
-            "Le service Gemini a renvoyé une erreur HTTP "
+            "Gemini a renvoyé une erreur HTTP "
             + str(exc.code)
             + ". Réessaie plus tard."
         )
 
     except (URLError, TimeoutError):
         raise RuntimeError(
-            "Le service Gemini ne répond pas actuellement. "
-            "Vérifie la connexion et réessaie."
+            "Impossible de joindre le service Gemini. "
+            "Vérifie ta connexion et réessaie plus tard."
         )
 
     try:
@@ -570,14 +717,14 @@ Respecte exactement cette structure :
         )
 
         if not answer.strip():
-            raise ValueError("La réponse de Gemini est vide.")
+            raise ValueError("Réponse vide de Gemini.")
 
         project = extract_json(answer)
 
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         raise RuntimeError(
             "La réponse de l'IA n'a pas pu être convertie "
-            "en projet. Essaie une description plus simple."
+            "en projet. Réessaie avec une description plus simple."
         )
 
     if not isinstance(project, dict):
@@ -589,17 +736,14 @@ Respecte exactement cette structure :
 
     if not isinstance(raw_files, list) or not raw_files:
         raise RuntimeError(
-            "Aucun fichier n'a été fourni par l'IA."
+            "L'IA n'a fourni aucun fichier exploitable."
         )
-
-    if len(raw_files) > MAX_FILES:
-        raw_files = raw_files[:MAX_FILES]
 
     files = []
     seen_paths = set()
     total_size = 0
 
-    for item in raw_files:
+    for item in raw_files[:MAX_FILES]:
         if not isinstance(item, dict):
             continue
 
@@ -613,9 +757,6 @@ Respecte exactement cette structure :
             continue
 
         content_bytes = content.encode("utf-8")
-
-        if len(content_bytes) > MAX_TOTAL_SIZE:
-            continue
 
         if total_size + len(content_bytes) > MAX_TOTAL_SIZE:
             break
@@ -631,27 +772,35 @@ Respecte exactement cette structure :
 
     if not files:
         raise RuntimeError(
-            "Les fichiers générés sont vides ou invalides. "
-            "Réessaie avec une demande plus précise."
+            "Les fichiers générés sont vides ou invalides."
         )
 
     project_name = str(
         project.get("project_name", "mon-projet")
     )[:100]
 
-    project["project_name"] = project_name
-    project["summary"] = str(
-        project.get("summary", "Projet généré par l'IA.")
-    )[:3000]
+    project = {
+        "project_name": project_name,
+        "summary": str(
+            project.get(
+                "summary",
+                "Projet généré par GENIUS APP AI."
+            )
+        )[:3000],
+        "instructions": str(
+            project.get(
+                "instructions",
+                "Consulte le fichier README.md."
+            )
+        )[:10000],
+        "files": files
+    }
 
-    project["instructions"] = str(
-        project.get(
-            "instructions",
-            "Consulte le fichier README.md."
-        )
-    )[:10000]
-
-    project["files"] = files
+    # Vérification locale : aucune requête Gemini supplémentaire.
+    project["checks"] = validate_project_structure(
+        files,
+        platform
+    )
 
     return project
 
@@ -702,7 +851,7 @@ def index():
         elif len(description) > MAX_DESCRIPTION_LENGTH:
             error = (
                 "Ta description est trop longue. "
-                "Réduis-la à 5000 caractères maximum."
+                "Utilise 5000 caractères maximum."
             )
 
         else:
@@ -713,32 +862,34 @@ def index():
                 )
 
                 zip_data = create_zip(project)
+
                 download_token = uuid.uuid4().hex
+
+                safe_name = re.sub(
+                    r"[^a-zA-Z0-9_-]+",
+                    "-",
+                    project["project_name"]
+                ).strip("-")[:60] or "mon-projet"
 
                 with bundles_lock:
                     bundles[download_token] = {
                         "created": time.time(),
                         "data": zip_data,
-                        "name": re.sub(
-                            r"[^a-zA-Z0-9_-]+",
-                            "-",
-                            project["project_name"]
-                        ).strip("-")[:60] or "mon-projet"
+                        "name": safe_name
                     }
 
                 clean_expired_bundles()
-
             except RuntimeError as exc:
                 error = str(exc)
 
             except Exception:
                 app.logger.exception(
-                    "Erreur pendant la génération du projet"
+                    "Erreur de génération du projet"
                 )
 
                 error = (
                     "Une erreur inattendue est survenue. "
-                    "Réessaie avec une demande plus simple."
+                    "Réessaie plus tard."
                 )
 
     return render_template_string(
@@ -758,8 +909,8 @@ def download_project(token):
 
         if item is None:
             return (
-                "Ce téléchargement a expiré. "
-                "Génère à nouveau ton projet.",
+                "Téléchargement expiré. "
+                "Génère à nouveau le projet.",
                 404
             )
 
@@ -767,8 +918,8 @@ def download_project(token):
             bundles.pop(token, None)
 
             return (
-                "Ce téléchargement a expiré. "
-                "Génère à nouveau ton projet.",
+                "Téléchargement expiré. "
+                "Génère à nouveau le projet.",
                 404
             )
 
@@ -798,3 +949,4 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000)),
         debug=False
 )
+           
