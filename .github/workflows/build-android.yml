@@ -1,0 +1,98 @@
+name: GENIUS APP AI - Android APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_zip_url:
+        description: "URL de téléchargement du projet Android ZIP"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Prepare Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Download Android project
+        env:
+          PROJECT_ZIP_URL: ${{ inputs.project_zip_url }}
+        run: |
+          set -e
+          curl --fail --location --silent --show-error \
+            "$PROJECT_ZIP_URL" \
+            --output project.zip
+          unzip -q project.zip -d project
+          rm project.zip
+
+      - name: Find Android project
+        id: locate
+        run: |
+          set -e
+          SETTINGS=$(find project -type f \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -print -quit)
+
+          if [ -z "$SETTINGS" ]; then
+            echo "Erreur : settings.gradle ou settings.gradle.kts introuvable."
+            exit 1
+          fi
+
+          ROOT=$(dirname "$SETTINGS")
+
+          if [ ! -f "$ROOT/gradlew" ]; then
+            echo "gradlew_not_found=true" >> "$GITHUB_OUTPUT"
+          else
+            chmod +x "$ROOT/gradlew"
+            echo "gradlew_not_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "project_root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Compile Android APK
+        working-directory: ${{ steps.locate.outputs.project_root }}
+        run: |
+          set -e
+
+          if [ "${{ steps.locate.outputs.gradlew_not_found }}" = "true" ]; then
+            gradle assembleDebug
+          else
+            ./gradlew assembleDebug
+          fi
+
+      - name: Find generated APK
+        id: apk
+        working-directory: ${{ steps.locate.outputs.project_root }}
+        run: |
+          set -e
+          APK=$(find . -type f -path "*/build/outputs/apk/*/*.apk" -print -quit)
+
+          if [ -z "$APK" ]; then
+            echo "Erreur : aucun fichier APK généré."
+            exit 1
+          fi
+
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Publish APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GENIUS-APP-ANDROID-APK
+          path: ${{ steps.locate.outputs.project_root }}/${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
