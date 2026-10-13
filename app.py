@@ -38,7 +38,6 @@ MAX_FILES = 40
 MAX_TOTAL_SIZE = 1_500_000
 MAX_DESCRIPTION_LENGTH = 5000
 
-# Les archives sont conservées temporairement en mémoire.
 PROJECTS = {}
 PROJECTS_LOCK = threading.Lock()
 PROJECT_TTL = 1800
@@ -268,55 +267,46 @@ Règles :
         },
     }
 
-        req = Request(
-        endpoint,
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
     result = None
     max_attempts = 4
 
     for attempt in range(max_attempts):
+        req = Request(
+            endpoint,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
         try:
             with urlopen(req, timeout=180) as response:
                 result = json.loads(
                     response.read().decode("utf-8")
                 )
-
             break
 
         except HTTPError as exc:
             detail = exc.read().decode(
                 "utf-8",
-                errors="replace"
+                errors="replace",
             )
 
-            # Extraire le message d'erreur fourni par Google.
             try:
                 error_data = json.loads(detail)
                 error_info = error_data.get("error", {})
                 error_message = error_info.get(
                     "message",
-                    "Aucun détail fourni par Google."
+                    "Aucun détail fourni par Google.",
                 )
                 error_status = error_info.get("status", "")
             except (json.JSONDecodeError, AttributeError):
-                error_message = (
-                    "Réponse d'erreur non lisible."
-                )
+                error_message = "Réponse d'erreur non lisible."
                 error_status = ""
 
-            # Réessayer uniquement les erreurs temporaires.
-            retryable = exc.code in (
-                408, 500, 502, 503, 504
-            )
+            retryable = exc.code in (408, 500, 502, 503, 504)
 
             if retryable and attempt < max_attempts - 1:
-                delay = (2 ** (attempt + 1)) + random.uniform(
-                    0, 1
-                )
+                delay = (2 ** (attempt + 1)) + random.uniform(0, 1)
 
                 app.logger.warning(
                     "Gemini HTTP %s. Tentative %s/%s. "
@@ -332,23 +322,21 @@ Règles :
 
             if exc.code == 429:
                 raise RuntimeError(
-                    "Gemini refuse temporairement la requête "
-                    "avec une erreur 429. Vérifie les limites "
-                    "de requêtes et le quota dans Google AI Studio. "
+                    "Limite ou quota Gemini atteint. "
+                    "Vérifie les quotas et les limites dans Google AI Studio. "
                     "Détail : " + error_message
                 ) from exc
 
             if exc.code == 404:
                 raise RuntimeError(
                     "Le modèle Gemini demandé est introuvable. "
-                    "Vérifie le nom du modèle dans la configuration "
-                    "Render. Détail : " + error_message
+                    "Vérifie GEMINI_MODEL dans Render. "
+                    "Détail : " + error_message
                 ) from exc
 
-            if exc.code in (408, 500, 502, 503, 504):
+            if retryable:
                 raise RuntimeError(
-                    "Gemini reste indisponible après plusieurs "
-                    "tentatives. Réessaie plus tard. "
+                    "Gemini reste indisponible après plusieurs tentatives. "
                     f"Erreur HTTP {exc.code}. "
                     f"Détail : {error_message}"
                 ) from exc
@@ -361,9 +349,7 @@ Règles :
 
         except (URLError, TimeoutError) as exc:
             if attempt < max_attempts - 1:
-                delay = (2 ** (attempt + 1)) + random.uniform(
-                    0, 1
-                )
+                delay = (2 ** (attempt + 1)) + random.uniform(0, 1)
 
                 app.logger.warning(
                     "Connexion Gemini impossible. "
@@ -375,30 +361,39 @@ Règles :
                 continue
 
             raise RuntimeError(
-                "Impossible de contacter Gemini après "
-                "plusieurs tentatives. Vérifie la connexion "
-                "et réessaie plus tard."
+                "Impossible de contacter Gemini après plusieurs "
+                "tentatives. Vérifie la connexion et réessaie plus tard."
             ) from exc
 
     if result is None:
         raise RuntimeError(
             "Gemini n'a renvoyé aucune réponse exploitable."
-                )
+        )
 
     try:
         text = result["candidates"][0]["content"]["parts"][0]["text"]
         data = json.loads(text)
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+    except (
+        KeyError,
+        IndexError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as exc:
         raise RuntimeError(
             "Gemini n'a pas renvoyé un projet JSON valide."
         ) from exc
 
     files = data.get("files")
+
     if not isinstance(files, list) or not files:
-        raise RuntimeError("Le projet généré ne contient aucun fichier.")
+        raise RuntimeError(
+            "Le projet généré ne contient aucun fichier."
+        )
 
     if len(files) > MAX_FILES:
-        raise RuntimeError("Le projet contient trop de fichiers.")
+        raise RuntimeError(
+            "Le projet contient trop de fichiers."
+        )
 
     cleaned = []
     total_size = 0
@@ -418,39 +413,51 @@ Règles :
 
         if (
             path.startswith("/")
-            or "\\" in path
             or any(part in ("", ".", "..") for part in parts)
             or ":" in parts[0]
         ):
-            raise RuntimeError("Un chemin de fichier dangereux a été rejeté.")
+            raise RuntimeError(
+                "Un chemin de fichier dangereux a été rejeté."
+            )
 
         if path in seen:
-            raise RuntimeError("Le projet contient des chemins en double.")
+            raise RuntimeError(
+                "Le projet contient des chemins en double."
+            )
 
         seen.add(path)
         total_size += len(content.encode("utf-8"))
 
         if total_size > MAX_TOTAL_SIZE:
-            raise RuntimeError("Le projet généré est trop volumineux.")
+            raise RuntimeError(
+                "Le projet généré est trop volumineux."
+            )
 
-        cleaned.append({"path": path, "content": content})
+        cleaned.append({
+            "path": path,
+            "content": content,
+        })
 
     if not cleaned:
-        raise RuntimeError("Aucun fichier valide n'a été généré.")
+        raise RuntimeError(
+            "Aucun fichier valide n'a été généré."
+        )
 
     if platform == "Android":
         paths = {item["path"] for item in cleaned}
+
         required = {
             "settings.gradle.kts",
             "build.gradle.kts",
             "app/build.gradle.kts",
             "app/src/main/AndroidManifest.xml",
         }
+
         if not required.issubset(paths):
             raise RuntimeError(
                 "Le projet Android est incomplet : des fichiers Gradle "
-                "ou le manifeste sont manquants. Réessaie avec une demande "
-                "plus simple."
+                "ou le manifeste sont manquants. Réessaie avec une "
+                "demande plus simple."
             )
 
     return cleaned
@@ -458,11 +465,14 @@ Règles :
 
 def clean_old_projects():
     now = time.time()
+
     with PROJECTS_LOCK:
         expired = [
-            key for key, item in PROJECTS.items()
+            key
+            for key, item in PROJECTS.items()
             if now - item["created"] > PROJECT_TTL
         ]
+
         for key in expired:
             PROJECTS.pop(key, None)
 
@@ -476,7 +486,10 @@ def make_zip(files):
         compression=zipfile.ZIP_DEFLATED,
     ) as archive:
         for item in files:
-            archive.writestr(item["path"], item["content"])
+            archive.writestr(
+                item["path"],
+                item["content"],
+            )
 
     buffer.seek(0)
     return buffer.getvalue()
@@ -500,7 +513,10 @@ def download_project(project_id):
         project = PROJECTS.get(project_id)
 
     if not project:
-        abort(404, "Le ZIP a expiré. Génère à nouveau le projet.")
+        abort(
+            404,
+            "Le ZIP a expiré. Génère à nouveau le projet.",
+        )
 
     return send_file(
         io.BytesIO(project["zip"]),
@@ -550,25 +566,29 @@ def trigger_github_build(zip_url):
                 raise RuntimeError(
                     "GitHub n'a pas accepté la demande de compilation."
                 )
+
     except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
         if exc.code == 401:
             raise RuntimeError(
                 "Le jeton GitHub est invalide ou expiré."
             ) from exc
+
         if exc.code == 403:
             raise RuntimeError(
                 "GitHub refuse l'accès. Vérifie la permission Actions "
                 "Read and write du jeton."
             ) from exc
+
         if exc.code == 404:
             raise RuntimeError(
                 "Workflow introuvable. Vérifie build-android.yml "
                 "sur la branche main."
             ) from exc
+
         raise RuntimeError(
             f"Erreur GitHub HTTP {exc.code}. Vérifie la configuration."
         ) from exc
+
     except (URLError, TimeoutError) as exc:
         raise RuntimeError(
             "Impossible de joindre GitHub Actions."
@@ -580,8 +600,15 @@ def home():
     if request.method == "GET":
         return render_page()
 
-    description = request.form.get("description", "").strip()
-    platform = request.form.get("platform", "Android").strip()
+    description = request.form.get(
+        "description",
+        "",
+    ).strip()
+
+    platform = request.form.get(
+        "platform",
+        "Android",
+    ).strip()
 
     if platform not in ("Android", "Web"):
         platform = "Android"
@@ -625,6 +652,7 @@ def home():
 
         if platform == "Android":
             trigger_github_build(zip_url)
+
             message = (
                 f"Projet généré avec {len(files)} fichiers. "
                 "La demande de compilation a été envoyée à GitHub Actions. "
@@ -632,12 +660,15 @@ def home():
                 "ou son environnement Gradle est incompatible. "
                 "Tu peux télécharger le ZIP ci-dessous."
             )
+
             heading = "Projet créé — compilation demandée"
+
         else:
             message = (
                 f"Projet Web généré avec {len(files)} fichiers. "
                 "Télécharge l'archive ZIP ci-dessous."
             )
+
             heading = "Projet Web créé"
 
         return render_page(
@@ -658,8 +689,10 @@ def home():
             success=False,
             status=400,
         )
+
     except Exception:
         app.logger.exception("Erreur inattendue")
+
         return render_page(
             description=description,
             platform=platform,
@@ -671,7 +704,8 @@ def home():
             success=False,
             status=500,
         )
-
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "5000")),
+)
