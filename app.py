@@ -3,6 +3,7 @@ import re
 import io
 import json
 import time
+import random
 import uuid
 import zipfile
 import threading
@@ -267,29 +268,122 @@ Règles :
         },
     }
 
-    req = Request(
+        req = Request(
         endpoint,
         data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
 
-    try:
-        with urlopen(req, timeout=180) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        if exc.code == 429:
-            raise RuntimeError(
-                "Quota Gemini atteint. Réessaie après la réinitialisation."
+    result = None
+    max_attempts = 4
+
+    for attempt in range(max_attempts):
+        try:
+            with urlopen(req, timeout=180) as response:
+                result = json.loads(
+                    response.read().decode("utf-8")
+                )
+
+            break
+
+        except HTTPError as exc:
+            detail = exc.read().decode(
+                "utf-8",
+                errors="replace"
             )
+
+            # Extraire le message d'erreur fourni par Google.
+            try:
+                error_data = json.loads(detail)
+                error_info = error_data.get("error", {})
+                error_message = error_info.get(
+                    "message",
+                    "Aucun détail fourni par Google."
+                )
+                error_status = error_info.get("status", "")
+            except (json.JSONDecodeError, AttributeError):
+                error_message = (
+                    "Réponse d'erreur non lisible."
+                )
+                error_status = ""
+
+            # Réessayer uniquement les erreurs temporaires.
+            retryable = exc.code in (
+                408, 500, 502, 503, 504
+            )
+
+            if retryable and attempt < max_attempts - 1:
+                delay = (2 ** (attempt + 1)) + random.uniform(
+                    0, 1
+                )
+
+                app.logger.warning(
+                    "Gemini HTTP %s. Tentative %s/%s. "
+                    "Nouvel essai dans %.1f secondes.",
+                    exc.code,
+                    attempt + 2,
+                    max_attempts,
+                    delay,
+                )
+
+                time.sleep(delay)
+                continue
+
+            if exc.code == 429:
+                raise RuntimeError(
+                    "Gemini refuse temporairement la requête "
+                    "avec une erreur 429. Vérifie les limites "
+                    "de requêtes et le quota dans Google AI Studio. "
+                    "Détail : " + error_message
+                ) from exc
+
+            if exc.code == 404:
+                raise RuntimeError(
+                    "Le modèle Gemini demandé est introuvable. "
+                    "Vérifie le nom du modèle dans la configuration "
+                    "Render. Détail : " + error_message
+                ) from exc
+
+            if exc.code in (408, 500, 502, 503, 504):
+                raise RuntimeError(
+                    "Gemini reste indisponible après plusieurs "
+                    "tentatives. Réessaie plus tard. "
+                    f"Erreur HTTP {exc.code}. "
+                    f"Détail : {error_message}"
+                ) from exc
+
+            raise RuntimeError(
+                f"Erreur Gemini HTTP {exc.code}. "
+                f"Statut : {error_status or 'inconnu'}. "
+                f"Détail : {error_message}"
+            ) from exc
+
+        except (URLError, TimeoutError) as exc:
+            if attempt < max_attempts - 1:
+                delay = (2 ** (attempt + 1)) + random.uniform(
+                    0, 1
+                )
+
+                app.logger.warning(
+                    "Connexion Gemini impossible. "
+                    "Nouvel essai dans %.1f secondes.",
+                    delay,
+                )
+
+                time.sleep(delay)
+                continue
+
+            raise RuntimeError(
+                "Impossible de contacter Gemini après "
+                "plusieurs tentatives. Vérifie la connexion "
+                "et réessaie plus tard."
+            ) from exc
+
+    if result is None:
         raise RuntimeError(
-            f"Erreur Gemini HTTP {exc.code}. Vérifie le modèle et le quota."
-        ) from exc
-    except (URLError, TimeoutError) as exc:
-        raise RuntimeError(
-            "Impossible de contacter Gemini. Réessaie plus tard."
-        ) from exc
+            "Gemini n'a renvoyé aucune réponse exploitable."
+                )
 
     try:
         text = result["candidates"][0]["content"]["parts"][0]["text"]
