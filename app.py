@@ -209,9 +209,31 @@ Le projet doit permettre gradle assembleDebug.
 """
     else:
         requirements = """
-Génère une petite application Web fonctionnelle.
-Inclue index.html, style.css et script.js.
-Utilise uniquement HTML, CSS et JavaScript standards.
+Génère une application Web complète, réellement fonctionnelle
+et adaptée aux téléphones Android.
+
+Fichiers obligatoires :
+- index.html
+- style.css
+- script.js
+
+EXIGENCES FONCTIONNELLES :
+1. Lis attentivement la demande de l'utilisateur et respecte ses règles.
+2. Chaque bouton doit exécuter une action réelle et visible.
+3. Relie correctement index.html, style.css et script.js.
+4. Charge script.js correctement pour garantir son initialisation.
+5. Vérifie que chaque identifiant HTML utilisé par JavaScript existe.
+6. Ajoute les événements nécessaires aux boutons et formulaires.
+7. Évite les erreurs JavaScript et les fonctions manquantes.
+8. Mets à jour l'interface après chaque action de l'utilisateur.
+9. Pour un jeu, implémente les règles, les scores et les conditions
+   de victoire conformément à la demande.
+10. Prévois les états de début, de jeu en cours et de fin de partie.
+11. N'annonce pas une victoire avant que les conditions soient atteintes.
+12. Utilise uniquement HTML, CSS et JavaScript standards.
+13. N'utilise aucune bibliothèque externe pour les fonctions principales.
+14. Adapte le design aux petits écrans et aux commandes tactiles.
+15. Fournis le code complet, sans fonction laissée inachevée.
 """
 
     prompt = f"""
