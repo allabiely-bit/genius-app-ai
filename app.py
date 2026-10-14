@@ -13,9 +13,8 @@ from flask import (
     Flask,
     request,
     render_template_string,
-    send_file,
-    abort,
-    url_for,
+    render_template,
+    send_file
 )
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -726,6 +725,10 @@ def home():
             success=False,
             status=500,
         )
+@app.route("/la-bataille")
+def la_bataille():
+    return render_template("la_bataille.html")
+    
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
